@@ -1,13 +1,15 @@
+import math
 import sqlite3
 from contextlib import closing
 from datetime import datetime
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
+from geopy.geocoders import Nominatim
 
 DB_FILE = "orders.db"
 
-# רשימת פריטים קבועה בראש
 ITEMS = [
     "קולה",
     "ספרייט",
@@ -135,6 +137,14 @@ def inject_rtl_css():
             direction: rtl;
         }
 
+        .small-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 0.8rem 1rem;
+            margin-bottom: 0.7rem;
+            background: #ffffff;
+        }
+
         @media (max-width: 768px) {
             .block-container {
                 padding-top: 1rem;
@@ -149,25 +159,108 @@ def inject_rtl_css():
     )
 
 
+@st.cache_resource
+def get_geolocator():
+    return Nominatim(user_agent="orders_route_planner_app")
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def geocode_address(address: str):
+    geolocator = get_geolocator()
+    try:
+        query = f"{address}, ישראל"
+        location = geolocator.geocode(query, timeout=10)
+        if location:
+            return {
+                "address": address,
+                "lat": location.latitude,
+                "lon": location.longitude,
+                "display_name": location.address,
+                "ok": True,
+            }
+    except Exception:
+        pass
+
+    return {
+        "address": address,
+        "lat": None,
+        "lon": None,
+        "display_name": "לא נמצאה התאמה מדויקת",
+        "ok": False,
+    }
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def nearest_neighbor_route(start_point, stops):
+    if not stops:
+        return []
+
+    remaining = stops.copy()
+    route = []
+    current = start_point
+
+    while remaining:
+        next_stop = min(
+            remaining,
+            key=lambda s: haversine_km(current["lat"], current["lon"], s["lat"], s["lon"]),
+        )
+        distance = haversine_km(current["lat"], current["lon"], next_stop["lat"], next_stop["lon"])
+        next_stop["distance_from_previous_km"] = round(distance, 2)
+        route.append(next_stop)
+        current = next_stop
+        remaining.remove(next_stop)
+
+    return route
+
+
+def build_waze_link_by_coords(lat, lon):
+    return f"https://www.waze.com/ul?ll={lat},{lon}&navigate=yes"
+
+
+def build_waze_link_by_text(address):
+    return f"https://www.waze.com/ul?q={quote(address)}&navigate=yes"
+
+
+def get_order_rows_for_table(search_text: str = ""):
+    orders = get_orders(search_text)
+    df = pd.DataFrame(
+        orders,
+        columns=["מזהה", "שם", "כתובת", "הזמנה", "שולם", "נוצר בתאריך"],
+    )
+    if not df.empty:
+        df["שולם"] = df["שולם"].astype(bool)
+    return df
+
+
 init_db()
 st.set_page_config(page_title="רישום הזמנות", page_icon="🧾", layout="centered")
 inject_rtl_css()
 
 st.title("🧾 רישום הזמנות")
-st.caption("אפליקציה פשוטה בעברית עם זיכרון מקומי")
+st.caption("אפליקציה פשוטה בעברית עם רשימת הזמנות, אימות כתובת בסיסי ומסלול יומי")
 
 with st.expander("רשימת פריטים קבועה", expanded=True):
     cols = st.columns(2)
     half = (len(ITEMS) + 1) // 2
-    for i, item in enumerate(ITEMS[:half]):
+    for item in ITEMS[:half]:
         cols[0].write(f"• {item}")
     for item in ITEMS[half:]:
         cols[1].write(f"• {item}")
 
-form_tab, orders_tab = st.tabs(["הזמנה חדשה", "רשימת הזמנות"])
+form_tab, orders_tab, route_tab = st.tabs(["הזמנה חדשה", "רשימת הזמנות", "מסלול יומי"])
 
 with form_tab:
     st.subheader("הוספת הזמנה")
+
     with st.form("new_order_form", clear_on_submit=True):
         customer_name = st.text_input("שם", placeholder="למשל: משה כהן")
         address = st.text_input("כתובת", placeholder="למשל: הרצל 12, תל אביב")
@@ -187,25 +280,34 @@ with form_tab:
                 st.success("ההזמנה נשמרה בהצלחה.")
                 st.rerun()
 
-    st.info(
-        "אפשר להוסיף השלמה אוטומטית לכתובות כמו וייז/גוגל, אבל זה דורש חיבור ל-API חיצוני. "
-        "בשלב הבא אפשר לשלב Google Places או שירות מפות אחר."
+    st.markdown("### בדיקת כתובת לפני שמירה")
+    verify_address = st.text_input(
+        "בדוק כתובת",
+        placeholder="כתוב כתובת בישראל כדי לבדוק אם נמצאה התאמה",
+        key="verify_address_input",
     )
+    if st.button("בדוק כתובת", use_container_width=True):
+        if verify_address.strip():
+            result = geocode_address(verify_address.strip())
+            if result["ok"]:
+                st.success("נמצאה כתובת.")
+                st.write(result["display_name"])
+                st.markdown(f"[פתח בוויז]({build_waze_link_by_coords(result['lat'], result['lon'])})")
+            else:
+                st.warning("לא נמצאה התאמה מדויקת. נסה לכתוב עיר, רחוב ומספר.")
+        else:
+            st.warning("צריך להזין כתובת לבדיקה.")
+
+    st.info("האימות כאן הוא בסיסי. למסלול מומלץ מלא עם אופטימיזציה אמיתית עדיף בעתיד לחבר API ייעודי של מפות/מסלולים.")
 
 with orders_tab:
     st.subheader("רשימת הזמנות")
     search_text = st.text_input("חיפוש לפי שם / כתובת / פריטים", placeholder="חפש הזמנה...")
-    orders = get_orders(search_text)
+    df = get_order_rows_for_table(search_text)
 
-    if not orders:
+    if df.empty:
         st.info("אין עדיין הזמנות שמורות.")
     else:
-        df = pd.DataFrame(
-            orders,
-            columns=["מזהה", "שם", "כתובת", "הזמנה", "שולם", "נוצר בתאריך"],
-        )
-        df["שולם"] = df["שולם"].astype(bool)
-
         edited_df = st.data_editor(
             df,
             use_container_width=True,
@@ -214,7 +316,7 @@ with orders_tab:
             column_config={
                 "מזהה": st.column_config.NumberColumn("מזהה", disabled=True),
                 "שם": st.column_config.TextColumn("שם", disabled=True),
-                "כתובת": st.column_config.TextColumn("כתובת", disabled=True),
+                "כתובת": st.column_config.TextColumn("כתובת", disabled=True, width="large"),
                 "הזמנה": st.column_config.TextColumn("הזמנה", disabled=True, width="medium"),
                 "שולם": st.column_config.CheckboxColumn("שולם"),
                 "נוצר בתאריך": st.column_config.TextColumn("נוצר בתאריך", disabled=True),
@@ -239,3 +341,112 @@ with orders_tab:
             delete_order(order_options[selected_label])
             st.success("ההזמנה נמחקה.")
             st.rerun()
+
+with route_tab:
+    st.subheader("מסלול יומי")
+    st.caption("הסדר כאן הוא המלצה מקורבת לפי כתובות שזוהו, לא אופטימיזציית כבישים מלאה.")
+
+    all_orders_df = get_order_rows_for_table("")
+    unpaid_only = st.checkbox("הצג רק הזמנות שלא שולמו", value=False)
+
+    if all_orders_df.empty:
+        st.info("אין הזמנות להצגת מסלול.")
+    else:
+        route_source_df = all_orders_df.copy()
+        if unpaid_only:
+            route_source_df = route_source_df[route_source_df["שולם"] == False]
+
+        if route_source_df.empty:
+            st.info("אין כרגע הזמנות מתאימות למסלול.")
+        else:
+            start_address = st.text_input(
+                "נקודת התחלה",
+                placeholder="למשל: הבית, רחוב האלון 5, באר שבע",
+                key="route_start_address",
+            )
+
+            if st.button("חשב סדר נסיעה מומלץ", use_container_width=True):
+                if not start_address.strip():
+                    st.warning("צריך להזין נקודת התחלה.")
+                else:
+                    start_geo = geocode_address(start_address.strip())
+                    if not start_geo["ok"]:
+                        st.error("לא הצלחתי לזהות את נקודת ההתחלה.")
+                    else:
+                        geocoded_stops = []
+                        unresolved = []
+
+                        for _, row in route_source_df.iterrows():
+                            geo = geocode_address(str(row["כתובת"]).strip())
+                            if geo["ok"]:
+                                geocoded_stops.append(
+                                    {
+                                        "id": int(row["מזהה"]),
+                                        "name": row["שם"],
+                                        "address": row["כתובת"],
+                                        "items": row["הזמנה"],
+                                        "paid": bool(row["שולם"]),
+                                        "created_at": row["נוצר בתאריך"],
+                                        "lat": geo["lat"],
+                                        "lon": geo["lon"],
+                                        "matched_address": geo["display_name"],
+                                    }
+                                )
+                            else:
+                                unresolved.append(f"{row['שם']} — {row['כתובת']}")
+
+                        if not geocoded_stops:
+                            st.error("לא הצלחתי לזהות אף כתובת למסלול.")
+                        else:
+                            route = nearest_neighbor_route(start_geo, geocoded_stops)
+
+                            result_rows = []
+                            map_rows = []
+                            for i, stop in enumerate(route, start=1):
+                                stop["order_index"] = i
+                                result_rows.append(
+                                    {
+                                        "סדר": i,
+                                        "שם": stop["name"],
+                                        "כתובת": stop["address"],
+                                        "התאמה": stop["matched_address"],
+                                        "הזמנה": stop["items"],
+                                        "מרחק מהנקודה הקודמת (קמ)": stop["distance_from_previous_km"],
+                                        "שולם": stop["paid"],
+                                        "וויז": build_waze_link_by_coords(stop["lat"], stop["lon"]),
+                                    }
+                                )
+                                map_rows.append({"lat": stop["lat"], "lon": stop["lon"]})
+
+                            result_df = pd.DataFrame(result_rows)
+                            st.session_state["route_result_df"] = result_df
+                            st.session_state["route_map_rows"] = pd.DataFrame(map_rows)
+                            st.session_state["route_unresolved"] = unresolved
+                            st.session_state["start_waze"] = build_waze_link_by_coords(start_geo["lat"], start_geo["lon"])
+
+            if "route_result_df" in st.session_state:
+                result_df = st.session_state["route_result_df"]
+                st.markdown(f"[פתח את נקודת ההתחלה בוויז]({st.session_state['start_waze']})")
+                st.dataframe(result_df.drop(columns=["וויז"]), use_container_width=True, hide_index=True)
+
+                st.markdown("### פתיחה מהירה בוויז")
+                for _, row in result_df.iterrows():
+                    st.markdown(
+                        f"<div class='small-card'><b>{int(row['סדר'])}. {row['שם']}</b><br>"
+                        f"{row['כתובת']}<br>"
+                        f"מרחק מהנקודה הקודמת: {row['מרחק מהנקודה הקודמת (קמ)']} קמ<br>"
+                        f"<a href='{row['וויז']}' target='_blank'>פתח בוויז</a></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                if "route_map_rows" in st.session_state and not st.session_state["route_map_rows"].empty:
+                    st.markdown("### מפה")
+                    st.map(st.session_state["route_map_rows"])
+
+                unresolved = st.session_state.get("route_unresolved", [])
+                if unresolved:
+                    st.warning("הכתובות הבאות לא זוהו ולכן לא נכנסו למסלול:")
+                    for item in unresolved:
+                        st.write(f"• {item}")
+
+                st.info("כפתור וויז פותח כל תחנה בנפרד. בהמשך אפשר לשלב מנוע מסלולים חיצוני כדי לקבל מסלול כבישים מדויק יותר.")
